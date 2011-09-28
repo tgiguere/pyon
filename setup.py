@@ -8,26 +8,27 @@ except ImportError:
 import os
 import sys
 
+import pyon
+
 # Add /usr/local/include to the path for macs, fixes easy_install for several packages (like gevent and pyyaml)
 if sys.platform == 'darwin':
     os.environ['C_INCLUDE_PATH'] = '/usr/local/include'
 
-version = '0.1'
 
-setup(  name = 'pyon',
-        version = version,
-        description = 'OOI ION Python Capability Container and Core Modules',
-        url = 'https://github.com/ooici/pyon',
-        download_url = 'http://ooici.net/releases',
-        license = 'Apache 2.0',
-        author = 'Adam R. Smith',
-        author_email = 'a2smith@ucsd.edu',
-        keywords = ['ooici','ioncore', 'pyon'],
-        dependency_links = [
+setup(  name='pyon',
+        version=pyon.__version__,
+        description='OOI ION Python Capability Container and Core Modules',
+        url='https://github.com/ooici/pyon',
+        download_url='http://ooici.net/releases',
+        license='Apache 2.0',
+        author='Adam R. Smith',
+        author_email='a2smith@ucsd.edu',
+        keywords=['ooici','ioncore', 'pyon'],
+        dependency_links=[
             'http://ooici.net/releases'
         ],
-        test_suite = 'pyon',
-        install_requires = [
+        test_suite='pyon',
+        install_requires=[
             'cython==0.14.1',
             'greenlet==0.3.1',
             'gevent==0.13.6',
