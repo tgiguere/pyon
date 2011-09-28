@@ -28,6 +28,7 @@ setup(  name='pyon',
             'http://ooici.net/releases'
         ],
         test_suite='pyon',
+        packages=['pyon'],
         install_requires=[
             'cython==0.14.1',
             'greenlet==0.3.1',
