@@ -13,7 +13,7 @@ from pika.connection import ConnectionParameters
 from pika.adapters import SelectConnection
 from pika import BasicProperties
 
-from pyon.core.bootstrap import CFG
+#from pyon.core.bootstrap import CFG
 from pyon.net import amqp
 from pyon.net import channel
 from pyon.util.log import log
@@ -116,7 +116,7 @@ def makeNode():
     """
     log.debug("In makeNode")
     node = NodeB()
-    messagingParams = CFG.server.amqp
+    #messagingParams = CFG.server.amqp
     log.debug("messagingParams: %s" % str(messagingParams))
     credentials = PlainCredentials(messagingParams["username"], messagingParams["password"])
     conn_parameters = ConnectionParameters(host=messagingParams["host"], virtual_host=messagingParams["vhost"], port=messagingParams["port"], credentials=credentials)
