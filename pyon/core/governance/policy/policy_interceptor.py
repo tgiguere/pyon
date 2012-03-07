@@ -4,18 +4,14 @@
 __author__ = 'Stephen P. Henrie'
 __license__ = 'Apache 2.0'
 
-
 from pyon.core.governance.governance_interceptor import BaseInternalGovernanceInterceptor
-from pyon.core.governance.policy.policy_decision import PolicyDecisionPoint
 from pyon.core.governance.governance_dispatcher import GovernanceDispatcher
 
 from pyon.util.log import log
+
 from ndg.xacml.core.context.result import Decision
 
 class PolicyInterceptor(BaseInternalGovernanceInterceptor):
-
-    def __init__(self, *args, **kwargs):
-        self.policy_decision_point = PolicyDecisionPoint()
 
     def outgoing(self, invocation):
 
@@ -34,19 +30,26 @@ class PolicyInterceptor(BaseInternalGovernanceInterceptor):
         else:
             log.debug("PolicyInterceptor.incoming: %s", invocation)
 
+        #If missing default to request just to be safe
+        msg_performative = invocation.get_header_value('performative', 'request')
 
-        #checking policy
-        #Annotate the message has started policy checking
-        invocation.message_annotations[GovernanceDispatcher.POLICY__STATUS_ANNOTATION] = GovernanceDispatcher.STATUS_STARTED
+        #No need to check policy for response or failure messages
+        if msg_performative != 'inform-result' and msg_performative != 'failure':
 
-        ret = self.policy_decision_point.check_policies(invocation)
-        log.debug("Policy Decision: " + str(ret))
+            #checking policy
+            #Annotate the message has started policy checking
+            invocation.message_annotations[GovernanceDispatcher.POLICY__STATUS_ANNOTATION] = GovernanceDispatcher.STATUS_STARTED
 
-        #Annonate the message has completed policy checking
-        invocation.message_annotations[GovernanceDispatcher.POLICY__STATUS_ANNOTATION] = GovernanceDispatcher.STATUS_COMPLETE
+            if self.governance_controller is not None:
+                ret = self.governance_controller.policy_decision_point_manager.check_policies(invocation)
 
-        if ret == Decision.DENY:
-            self.policy_denied_message(invocation)
+            log.debug("Policy Decision: " + str(ret))
+
+            #Annonate the message has completed policy checking
+            invocation.message_annotations[GovernanceDispatcher.POLICY__STATUS_ANNOTATION] = GovernanceDispatcher.STATUS_COMPLETE
+
+            if ret == Decision.DENY_STR:
+                self.policy_denied_message(invocation)
 
         return invocation
 

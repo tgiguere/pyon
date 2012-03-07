@@ -4,7 +4,6 @@
 Capability Container base class
 """
 
-
 __author__ = 'Adam R. Smith, Michael Meisinger, Dave Foster <dfoster@asascience.com>'
 __license__ = 'Apache 2.0'
 
@@ -23,14 +22,17 @@ from pyon.datastore.datastore import DataStore, DatastoreManager
 from pyon.event.event import EventRepository
 from pyon.ion.directory import Directory
 from pyon.ion.exchange import ExchangeManager
+from pyon.ion.resregistry import ResourceRegistry
 from pyon.ion.state import StateRepository
 from pyon.net.endpoint import ProcessRPCServer
 from pyon.net import messaging
 from pyon.util.file_sys import FileSystem
 from pyon.util.log import log
 from pyon.util.containers import DictModifier, dict_merge
+from pyon.core.governance.governance_controller import GovernanceController
 
 from interface.services.icontainer_agent import BaseContainerAgent
+from contextlib import contextmanager
 
 
 class Container(BaseContainerAgent):
@@ -62,8 +64,7 @@ class Container(BaseContainerAgent):
         from pyon.core import bootstrap
         bootstrap.container_instance = self
         bootstrap.assert_configuration(CFG)
-        bootstrap.sys_name = CFG.system.name or bootstrap.sys_name
-        log.debug("Container (sysname=%s) initializing ..." % bootstrap.sys_name)
+        log.debug("Container (sysname=%s) initializing ..." % bootstrap.get_sys_name())
 
         # Keep track of the overrides from the command-line, so they can trump app/rel file data
         self.spawn_args = kwargs
@@ -86,9 +87,13 @@ class Container(BaseContainerAgent):
         # File System - Interface to the OS File System, using correct path names and setups
         self.file_system = FileSystem(CFG)
 
+        # Governance Controller - manages the governance related interceptors
+        self.governance_controller = GovernanceController()
+
         # Coordinates the container start
         self._is_started = False
         self._capabilities = []
+        self._status = "INIT"
 
         log.debug("Container initialized, OK.")
 
@@ -105,10 +110,9 @@ class Container(BaseContainerAgent):
 
         # write out a PID file containing our agent messaging name
         with open(self.pidfile, 'w') as f:
-            from pyon.core.bootstrap import get_sys_name
             pid_contents = {'messaging': dict(CFG.server.amqp),
                             'container-agent': self.name,
-                            'container-xp': get_sys_name() }
+                            'container-xp': bootstrap.get_sys_name() }
             f.write(msgpack.dumps(pid_contents))
             atexit.register(self._cleanup_pid)
             self._capabilities.append("PID_FILE")
@@ -133,8 +137,11 @@ class Container(BaseContainerAgent):
         self.directory.register("/Containers", self.id, cc_agent=self.name)
         self._capabilities.append("DIRECTORY")
 
+        # Local resource registry
+        self.resource_registry = ResourceRegistry()
+        self._capabilities.append("RESOURCE_REGISTRY")
+
         # Create other repositories to make sure they are there and clean if needed
-        self.datastore_manager.get_datastore("resources", DataStore.DS_PROFILE.RESOURCES)
 
         self.datastore_manager.get_datastore("objects", DataStore.DS_PROFILE.OBJECTS)
 
@@ -144,11 +151,8 @@ class Container(BaseContainerAgent):
         self.event_repository = EventRepository()
         self._capabilities.append("EVENT_REPOSITORY")
 
-        # Start ExchangeManager. In particular establish broker connection
-        self.ex_manager.start()
-
-        # TODO: Move this in ExchangeManager - but there is an error
-        self.node, self.ioloop = messaging.make_node() # TODO: shortcut hack
+        # Start ExchangeManager, which starts the node (broker connection)
+        self.node, self.ioloop = self.ex_manager.start()
         self._capabilities.append("EXCHANGE_MANAGER")
 
         self.proc_manager.start()
@@ -157,17 +161,36 @@ class Container(BaseContainerAgent):
         self.app_manager.start()
         self._capabilities.append("APP_MANAGER")
 
+        self.governance_controller.start()
+        self._capabilities.append("GOVERNANCE_CONTROLLER")
+
+
         # Start the CC-Agent API
-        rsvc = ProcessRPCServer(node=self.node, name=self.name, service=self, process=self)
+        rsvc = ProcessRPCServer(node=self.node, from_name=self.name, service=self, process=self)
 
         # Start an ION process with the right kind of endpoint factory
         proc = self.proc_manager.proc_sup.spawn((CFG.cc.proctype or 'green', None), listener=rsvc)
         self.proc_manager.proc_sup.ensure_ready(proc)
         self._capabilities.append("CONTAINER_AGENT")
 
-        self._is_started = True
+        self._is_started    = True
+        self._status        = "RUNNING"
 
         log.info("Container started, OK.")
+
+    @contextmanager
+    def _push_status(self, new_status):
+        """
+        Temporarily sets the internal status flag.
+        Use this as a decorator or in a with-statement before calling a temporary status changing
+        method, like start_rel_from_url.
+        """
+        curstatus = self._status
+        self._status = new_status
+        try:
+            yield
+        finally:
+            self._status = curstatus
 
     def serve_forever(self):
         """ Run the container until killed. """
@@ -175,17 +198,34 @@ class Container(BaseContainerAgent):
         
         if not self.proc_manager.proc_sup.running:
             self.start()
-            
-        try:
-            # This just waits in this Greenlet for all child processes to complete,
-            # which is triggered somewhere else.
-            self.proc_manager.proc_sup.join_children()
-        except (KeyboardInterrupt, SystemExit) as ex:
-            log.info('Received a kill signal, shutting down the container.')
-        except:
-            log.exception('Unhandled error! Forcing container shutdown')
+
+        # serve forever short-circuits if immediate is on and children len is ok
+        num_procs = len(self.proc_manager.proc_sup.children)
+        immediate = CFG.system.get('immediate', False)
+        if not (immediate and num_procs == 1):  # only spawned greenlet is the CC-Agent
+
+            # print a warning just in case
+            if immediate and num_procs != 1:
+                log.warn("CFG.system.immediate=True but number of spawned processes is not 1 (%d)", num_procs)
+
+            try:
+                # This just waits in this Greenlet for all child processes to complete,
+                # which is triggered somewhere else.
+                self.proc_manager.proc_sup.join_children()
+            except (KeyboardInterrupt, SystemExit) as ex:
+                log.info('Received a kill signal, shutting down the container.')
+            except:
+                log.exception('Unhandled error! Forcing container shutdown')
+        else:
+            log.debug("Container.serve_forever short-circuiting due to CFG.system.immediate")
 
         self.proc_manager.proc_sup.shutdown(CFG.cc.timeout.shutdown)
+
+    def status(self):
+        """
+        Returns the internal status.
+        """
+        return self._status
             
     def _cleanup_pid(self):
         if self.pidfile:
@@ -215,6 +255,22 @@ class Container(BaseContainerAgent):
 
         log.debug("Container stopped, OK.")
 
+    def start_app(self, appdef=None, config=None):
+        with self._push_status("START_APP"):
+            return self.app_manager.start_app(appdef=appdef, config=config)
+
+    def start_app_from_url(self, app_url=''):
+        with self._push_status("START_APP_FROM_URL"):
+            return self.app_manager.start_app_from_url(app_url=app_url)
+
+    def start_rel(self, rel=None):
+        with self._push_status("START_REL"):
+            return self.app_manager.start_rel(rel=rel)
+
+    def start_rel_from_url(self, rel_url=''):
+        with self._push_status("START_REL_FROM_URL"):
+            return self.app_manager.start_rel_from_url(rel_url=rel_url)
+
     def _stop_capability(self, capability):
         if capability == "CONTAINER_AGENT":
             pass
@@ -228,14 +284,6 @@ class Container(BaseContainerAgent):
         elif capability == "EXCHANGE_MANAGER":
             self.ex_manager.stop()
 
-
-        elif capability == "DIRECTORY":
-            # Unregister from directory
-            self.directory.unregister_safe("/Container", self.id)
-
-            # Close directory (possible CouchDB connection)
-            self.directory.close()
-
         elif capability == "EVENT_REPOSITORY":
             # close event repository (possible CouchDB connection)
             self.event_repository.close()
@@ -243,6 +291,17 @@ class Container(BaseContainerAgent):
         elif capability == "STATE_REPOSITORY":
             # close state repository (possible CouchDB connection)
             self.state_repository.close()
+
+        elif capability == "RESOURCE_REGISTRY":
+            # close state resource registry (possible CouchDB connection)
+            self.resource_registry.close()
+
+        elif capability == "DIRECTORY":
+            # Unregister from directory
+            self.directory.unregister_safe("/Containers", self.id)
+
+            # Close directory (possible CouchDB connection)
+            self.directory.close()
 
         elif capability == "DATASTORE_MANAGER":
             # close any open connections to datastores
@@ -254,13 +313,14 @@ class Container(BaseContainerAgent):
             self.node.client.ioloop.start()     # loop until connection closes
             # destroy AMQP connection
 
+        elif capability == "GOVERNANCE_CONTROLLER":
+            self.governance_controller.stop()
+
         elif capability == "PID_FILE":
             self._cleanup_pid()
 
-
         else:
             raise ContainerError("Cannot stop capability: %s" % capability)
-
 
     def fail_fast(self, err_msg=""):
         """
@@ -269,5 +329,6 @@ class Container(BaseContainerAgent):
         log.error("Fail Fast: %s", err_msg)
         self.stop()
         log.error("Fail Fast: killing container")
+
         # The exit code of the terminated process is set to non-zero
         os.kill(os.getpid(), signal.SIGTERM)

@@ -8,10 +8,10 @@ from pyon.datastore.datastore import DataStore
 
 COUCHDB_CONFIGS = {
     DataStore.DS_PROFILE.OBJECTS:{
-        'views': ['object','association']
+        'views': ['object','association','attachment']
     },
     DataStore.DS_PROFILE.RESOURCES:{
-        'views': ['resource','association']
+        'views': ['resource','association','attachment']
     },
     DataStore.DS_PROFILE.DIRECTORY:{
         'views': ['directory','association']
@@ -36,19 +36,11 @@ COUCHDB_CONFIGS = {
 COUCHDB_VIEWS = {
     # Association (triple) related views
     'association':{
-        'all':{
-            'map':"""
-function(doc) {
-  if (doc.type_ == "Association") {
-    emit(doc._id, doc);
-  }
-}""",
-        },
         'by_sub':{
             'map':"""
 function(doc) {
   if (doc.type_ == "Association") {
-    emit([doc.s, doc.p, doc.ot, doc.o], null);
+    emit([doc.s, doc.p, doc.ot, doc.o], doc);
   }
 }""",
         },
@@ -56,15 +48,26 @@ function(doc) {
             'map':"""
 function(doc) {
   if (doc.type_ == "Association") {
-    emit([doc.o, doc.p, doc.st, doc.s], null);
+    emit([doc.o, doc.p, doc.st, doc.s], doc);
   }
 }""",
         },
+        # For directed association lookup
         'by_ids':{
             'map':"""
 function(doc) {
   if (doc.type_ == "Association") {
-    emit([doc.s, doc.o, doc.p], null);
+    emit([doc.s, doc.o, doc.p, doc.at, doc.srv, doc.orv], doc);
+  }
+}""",
+        },
+        # For undirected association lookup
+        'by_id':{
+            'map':"""
+function(doc) {
+  if (doc.type_ == "Association") {
+    emit([doc.s, doc.p, doc.at, doc.srv, doc.orv], doc);
+    emit([doc.o, doc.p, doc.at, doc.srv, doc.orv], doc);
   }
 }""",
         },
@@ -72,7 +75,7 @@ function(doc) {
             'map':"""
 function(doc) {
   if (doc.type_ == "Association") {
-    emit([doc.p, doc.s, doc.o], null);
+    emit([doc.p, doc.s, doc.o, doc.at, doc.srv, doc.orv], doc);
   }
 }""",
         }
@@ -89,9 +92,21 @@ function(doc) {
         },
     },
 
+    # Attachment objects
+    'attachment':{
+        'by_resource':{
+            'map':"""
+function(doc) {
+  if (doc.type_ && doc.type_=="Attachment") {
+    emit([doc.object_id, doc.ts_created], null);
+  }
+}""",
+        }
+    },
+
     # Resource ION object related views
     # Resources have a type, life cycle state and name
-    # Note: the name in  the indexes leads to a sort by name
+    # Note: the name in the indexes leads to a sort by name
     'resource':{
         'by_type':{
             'map':"""
@@ -104,7 +119,7 @@ function(doc) {
         # The following is a more sophisticated index. It does two things for each Resource object:
         # 1: It emits an index value prefixed by 0 for the actual lcstate
         # 2: It emits an index value prefixed by 1,parent_state for all parent states
-        # Thereby it is possible to search for resources by hieararchical state and still be able
+        # Thereby it is possible to search for resources by hierarchical state and still be able
         # to return result sets that objects once only.
         # Note: the order of the type_ in the key is important for case 2, so that range queries are possible
         # with both type_ without.
@@ -113,15 +128,14 @@ function(doc) {
 function(doc) {
   if (doc.type_ && doc.type_!="Association") {
     emit([0, doc.lcstate, doc.type_, doc.name], null);
-    if (doc.lcstate != undefined && doc.lcstate != "" && doc.lcstate != "DRAFT" && doc.lcstate != "RETIRED") {
-      emit([1, "REGISTERED", doc.type_, doc.lcstate, doc.name], null);
-      if (doc.lcstate == "PLANNED" || doc.lcstate == "DEVELOPED" || doc.lcstate == "INTEGRATED") {
-        emit([1, "UNDEPLOYED", doc.type_, doc.lcstate, doc.name], null);
-      } else {
-        emit([1, "DEPLOYED", doc.type_, doc.lcstate, doc.name], null);
-        if (doc.lcstate == "DISCOVERABLE" || doc.lcstate == "AVAILABLE") {
-          emit([1, "PUBLIC", doc.type_, doc.lcstate, doc.name], null);
-        }
+    if (doc.lcstate != undefined && doc.lcstate != "") {
+      if (doc.lcstate.lastIndexOf("DRAFT",0)!=0 && doc.lcstate != "RETIRED") {
+        emit([1, "REGISTERED", doc.type_, doc.lcstate, doc.name], null);
+      }
+      comps = doc.lcstate.split("_")
+      if (comps.length == 2) {
+        emit([1, comps[0], doc.type_, doc.lcstate, doc.name], null);
+        emit([1, comps[1], doc.type_, doc.lcstate, doc.name], null);
       }
     }
   }
@@ -134,7 +148,7 @@ function(doc) {
     emit([doc.name, doc.type_, doc.lcstate], null);
   }
 }""",
-        }
+        },
     },
 
     # Directory related objects
@@ -144,10 +158,8 @@ function(doc) {
             'map':"""
 function(doc) {
   if (doc.type_ == "DirEntry") {
-    if (doc.parent.indexOf('/') != 0) return;
     levels = doc.parent.split('/');
-    levels.splice(0,1);
-    if (doc.parent == "/") levels.pop();
+    if (doc.parent == "") levels.pop();
     levels.push(doc.key);
     emit(levels, doc);
   }
@@ -157,8 +169,17 @@ function(doc) {
             'map':"""
 function(doc) {
   if (doc.type_ == "DirEntry") {
-    if (doc.parent.indexOf('/') != 0) return;
     emit([doc.key, doc.parent], doc);
+  }
+}""",
+        },
+        'by_attribute':{
+            'map':"""
+function(doc) {
+  if (doc.type_ == "DirEntry") {
+    for (var attr in doc.attributes) {
+      emit([attr, doc.attributes[attr], doc.parent], doc);
+    }
   }
 }""",
         },

@@ -15,12 +15,16 @@ from pyon.core.exception import BadRequest, Conflict, NotFound
 from pyon.core.object import IonObjectBase, IonObjectSerializer, IonObjectDeserializer
 from pyon.datastore.datastore import DataStore
 from pyon.datastore.couchdb.couchdb_config import get_couchdb_views
-from pyon.ion.resource import ResourceLifeCycleSM
+from pyon.ion.resource import CommonResourceLifeCycleSM
 from pyon.util.log import log
 from pyon.core.bootstrap import CFG
 
-# Marks key range upper bound
-END_MARKER = "ZZZZZ"
+# Token for a most likely non-inclusive key range upper bound (end_key), for queries such as
+# prefix <= keys < upper bound: e.g. ['some','value'] <= keys < ['some','value', END_MARKER]
+# or "somestr" <= keys < "somestr"+END_MARKER for string prefix checking
+# Note: Use highest ASCII characters here, not 8bit
+#END_MARKER = "\x7f\x7f\x7f\x7f"
+END_MARKER = "ZZZZZZ"
 
 def sha1hex(doc):
     """
@@ -290,7 +294,7 @@ class CouchDB_DataStore(DataStore):
         id, version = res
         return (id, version)
 
-    def delete(self, obj, datastore_name=""):
+    def delete(self, obj, datastore_name="", del_associations=False):
         if not isinstance(obj, IonObjectBase) and not isinstance(obj, str):
             raise BadRequest("Obj param is not instance of IonObjectBase or string id")
         if type(obj) is str:
@@ -300,30 +304,30 @@ class CouchDB_DataStore(DataStore):
                 raise BadRequest("Doc must have '_id'")
             if '_rev' not in obj:
                 raise BadRequest("Doc must have '_rev'")
-            self.delete_doc(self._ion_object_to_persistence_dict(obj), datastore_name=datastore_name)
+            self.delete_doc(self._ion_object_to_persistence_dict(obj), datastore_name=datastore_name, del_associations=del_associations)
 
-    def delete_doc(self, doc, datastore_name=""):
+    def delete_doc(self, doc, datastore_name="", del_associations=False):
         ds, datastore_name = self._get_datastore(datastore_name)
-        if type(doc) is str:
-            log.info('Deleting object %s/%s' % (datastore_name, doc))
-            if self._is_in_association(doc, datastore_name):
-                obj = self.read(doc, datastore_name)
-                log.warn("XXXXXXX Attempt to delete object %s that still has associations" % str(obj))
-#                raise BadRequest("Object cannot be deleted until associations are broken")
-            try:
-                del ds[doc]
-            except ResourceNotFound:
-                raise NotFound('Object with id %s does not exist.' % str(doc))
-        else:
-            log.info('Deleting object %s/%s' % (datastore_name, doc["_id"]))
-            if self._is_in_association(doc["_id"], datastore_name):
-                log.warn("XXXXXXX Attempt to delete object %s that still has associations" % str(doc))
-#                raise BadRequest("Object cannot be deleted until associations are broken")
-            try:
-                res = ds.delete(doc)
-            except ResourceNotFound:
-                raise NotFound('Object with id %s does not exist.' % str(doc["_id"]))
-            log.debug('Delete result: %s' % str(res))
+        doc_id = doc if type(doc) is str else doc["_id"]
+        log.debug('Deleting object %s/%s' % (datastore_name, doc_id))
+
+        if del_associations:
+            assoc_ids = self.find_associations(anyobj=doc_id, id_only=True)
+            for aid in assoc_ids:
+                self.delete(aid, datastore_name=datastore_name)
+            log.debug("Deleted %n associations for object %s" % (len(assoc_ids), doc_id))
+
+        elif self._is_in_association(doc_id, datastore_name):
+            log.warn("XXXXXXX Attempt to delete object %s that still has associations" % doc_id)
+#           raise BadRequest("Object cannot be deleted until associations are broken")
+
+        try:
+            if type(doc) is str:
+                del ds[doc_id]
+            else:
+                ds.delete(doc)
+        except ResourceNotFound:
+            raise NotFound('Object with id %s does not exist.' % doc_id)
 
     def _get_viewname(self, design, name):
         return "_design/%s/_view/%s" % (design, name)
@@ -375,22 +379,31 @@ class CouchDB_DataStore(DataStore):
             except ResourceNotFound:
                 pass
 
+    def _get_view_args(self, all_args):
+        """
+        @brief From given all_args dict, extract all entries that are valid CouchDB view options.
+        @see http://wiki.apache.org/couchdb/HTTP_view_API
+        """
+        view_args = dict((k, v) for k,v in all_args.iteritems() if k in ('descending', 'stale', 'skip', 'inclusive_end', 'update_seq'))
+        limit = int(all_args.get('limit', 0))
+        if limit>0:
+            view_args['limit'] = limit
+        return view_args
+
     def _is_in_association(self, obj_id, datastore_name=""):
         log.debug("_is_in_association(%s)" % obj_id)
         if not obj_id:
             raise BadRequest("Must provide object id")
         ds, datastore_name = self._get_datastore(datastore_name)
 
-        view = ds.view(self._get_viewname("association","all"))
-        associations = [row.value for row in view]
+        assoc_ids = self.find_associations(anyobj=obj_id, id_only=True, limit=1)
+        if assoc_ids:
+            log.debug("Object found as object in associations: First is %s" % assoc_ids)
+            return True
 
-        for association in associations:
-            if association["s"] == obj_id or association["o"] == obj_id:
-                log.debug("association found(%s)" % association)
-                return True
         return False
 
-    def find_objects(self, subject, predicate=None, object_type=None, id_only=False):
+    def find_objects(self, subject, predicate=None, object_type=None, id_only=False, **kwargs):
         log.debug("find_objects(subject=%s, predicate=%s, object_type=%s, id_only=%s" % (subject, predicate, object_type, id_only))
         if type(id_only) is not bool:
             raise BadRequest('id_only must be type bool, not %s' % type(id_only))
@@ -405,25 +418,20 @@ class CouchDB_DataStore(DataStore):
                 raise BadRequest("Object id not available in subject")
             else:
                 subject_id = subject._id
-        view = ds.view(self._get_viewname("association","all"))
-        associations = [row.value for row in view]
 
-        obj_assocs = []
-        obj_ids = []
-        for association in associations:
-            if association["s"] == subject_id:
-                if predicate:
-                    if association["p"] == predicate:
-                        if object_type:
-                            if association["ot"] == object_type:
-                                obj_assocs.append(self._persistence_dict_to_ion_object(association))
-                                obj_ids.append(association["o"])
-                        else:
-                            obj_assocs.append(self._persistence_dict_to_ion_object(association))
-                            obj_ids.append(association["o"])
-                else:
-                    obj_assocs.append(self._persistence_dict_to_ion_object(association))
-                    obj_ids.append(association["o"])
+        view_args = self._get_view_args(kwargs)
+        view = ds.view(self._get_viewname("association","by_sub"), **view_args)
+        key = [subject_id]
+        if predicate:
+            key.append(predicate)
+            if object_type:
+                key.append(object_type)
+        endkey = list(key)
+        endkey.append(END_MARKER)
+        rows = view[key:endkey]
+
+        obj_assocs = [self._persistence_dict_to_ion_object(row['value']) for row in rows]
+        obj_ids = [assoc.o for assoc in obj_assocs]
 
         log.debug("find_objects() found %s objects" % (len(obj_ids)))
         if id_only:
@@ -432,7 +440,7 @@ class CouchDB_DataStore(DataStore):
         obj_list = self.read_mult(obj_ids)
         return (obj_list, obj_assocs)
 
-    def find_subjects(self, subject_type=None, predicate=None, obj=None, id_only=False):
+    def find_subjects(self, subject_type=None, predicate=None, obj=None, id_only=False, **kwargs):
         log.debug("find_subjects(subject_type=%s, predicate=%s, object=%s, id_only=%s" % (subject_type, predicate, obj, id_only))
         if type(id_only) is not bool:
             raise BadRequest('id_only must be type bool, not %s' % type(id_only))
@@ -447,25 +455,20 @@ class CouchDB_DataStore(DataStore):
                 raise BadRequest("Object id not available in object")
             else:
                 object_id = obj._id
-        view = ds.view(self._get_viewname("association","all"))
-        associations = [row.value for row in view]
 
-        sub_assocs = []
-        sub_ids = []
-        for association in associations:
-            if association["o"] == object_id:
-                if predicate:
-                    if association["p"] == predicate:
-                        if subject_type:
-                            if association["st"] == subject_type:
-                                sub_assocs.append(self._persistence_dict_to_ion_object(association))
-                                sub_ids.append(association["s"])
-                        else:
-                            sub_assocs.append(self._persistence_dict_to_ion_object(association))
-                            sub_ids.append(association["s"])
-                else:
-                    sub_assocs.append(self._persistence_dict_to_ion_object(association))
-                    sub_ids.append(association["s"])
+        view_args = self._get_view_args(kwargs)
+        view = ds.view(self._get_viewname("association","by_obj"), **view_args)
+        key = [object_id]
+        if predicate:
+            key.append(predicate)
+            if subject_type:
+                key.append(subject_type)
+        endkey = list(key)
+        endkey.append(END_MARKER)
+        rows = view[key:endkey]
+
+        sub_assocs = [self._persistence_dict_to_ion_object(row['value']) for row in rows]
+        sub_ids = [assoc.s for assoc in sub_assocs]
 
         log.debug("find_subjects() found %s subjects" % (len(sub_ids)))
         if id_only:
@@ -474,17 +477,20 @@ class CouchDB_DataStore(DataStore):
         sub_list = self.read_mult(sub_ids)
         return (sub_list, sub_assocs)
 
-    def find_associations(self, subject=None, predicate=None, obj=None, id_only=True):
+    def find_associations(self, subject=None, predicate=None, obj=None, assoc_type=None, id_only=True, anyobj=None, **kwargs):
         log.debug("find_associations(subject=%s, predicate=%s, object=%s)" % (subject, predicate, obj))
         if type(id_only) is not bool:
             raise BadRequest('id_only must be type bool, not %s' % type(id_only))
-        if subject and obj or predicate:
-            pass
-        else:
+        if not (subject and obj or predicate or anyobj):
             raise BadRequest("Illegal parameters")
-        ds, datastore_name = self._get_datastore()
+        if assoc_type and not predicate:
+            raise BadRequest("Illegal parameters")
 
-        if subject and obj:
+        # Support
+        if subject is None and obj is None and anyobj:
+            subject = anyobj
+
+        if subject:
             if type(subject) is str:
                 subject_id = subject
             else:
@@ -492,6 +498,7 @@ class CouchDB_DataStore(DataStore):
                     raise BadRequest("Object id not available in subject")
                 else:
                     subject_id = subject._id
+        if obj:
             if type(obj) is str:
                 object_id = obj
             else:
@@ -499,24 +506,43 @@ class CouchDB_DataStore(DataStore):
                     raise BadRequest("Object id not available in object")
                 else:
                     object_id = obj._id
-            view = ds.view(self._get_viewname("association","by_ids"), include_docs=(not id_only))
+
+        ds, datastore_name = self._get_datastore()
+        view_args = self._get_view_args(kwargs)
+
+        if subject and obj:
+            view = ds.view(self._get_viewname("association","by_ids"), **view_args)
             key = [subject_id, object_id]
             if predicate:
                 key.append(predicate)
+            if assoc_type:
+                key.append(assoc_type)
             endkey = list(key)
             endkey.append(END_MARKER)
             rows = view[key:endkey]
-        else:
-            view = ds.view(self._get_viewname("association","by_pred"), include_docs=(not id_only))
+        elif subject:
+            view = ds.view(self._get_viewname("association","by_id"), **view_args)
+            key = [subject_id]
+            if predicate:
+                key.append(predicate)
+            if assoc_type:
+                key.append(assoc_type)
+            endkey = list(key)
+            endkey.append(END_MARKER)
+            rows = view[key:endkey]
+        elif predicate:
+            view = ds.view(self._get_viewname("association","by_pred"), **view_args)
             key = [predicate]
             endkey = list(key)
             endkey.append(END_MARKER)
             rows = view[key:endkey]
+        else:
+            raise BadRequest("Illegal arguments")
 
         if id_only:
             assocs = [row.id for row in rows]
         else:
-            assocs = [self._persistence_dict_to_ion_object(row.doc.copy()) for row in rows]
+            assocs = [self._persistence_dict_to_ion_object(row['value']) for row in rows]
         log.debug("find_associations() found %s associations" % (len(assocs)))
         return assocs
 
@@ -551,7 +577,7 @@ class CouchDB_DataStore(DataStore):
             raise BadRequest('id_only must be type bool, not %s' % type(id_only))
         ds, datastore_name = self._get_datastore()
         view = ds.view(self._get_viewname("resource","by_lcstate"), include_docs=(not id_only))
-        is_hierarchical = (lcstate in ResourceLifeCycleSM.STATE_ALIASES)
+        is_hierarchical = (lcstate in CommonResourceLifeCycleSM.STATE_ALIASES)
         # lcstate is a hiearachical state and we need to treat the view differently
         if is_hierarchical:
             key = [1, lcstate]
@@ -613,31 +639,40 @@ class CouchDB_DataStore(DataStore):
         log.debug("find_dir_entries() found %s objects" % (len(res_entries)))
         return res_entries
 
-    def find_by_view(self, design_name, view_name, start_key=None, end_key=None,
-                           max_res=0, reverse=False, id_only=True, convert_doc=True):
+    def find_by_view(self, design_name, view_name, key=None, keys=None, start_key=None, end_key=None,
+                           id_only=True, convert_doc=True, **kwargs):
         """
         @brief Generic find function using an defined index
+        @retval Returns a list of triples: (att_id, index_row, Attachment object or none)
         """
         log.debug("find_by_view(%s/%s)" % (design_name, view_name))
         if type(id_only) is not bool:
             raise BadRequest('id_only must be type bool, not %s' % type(id_only))
         ds, datastore_name = self._get_datastore()
-        kwargs = {}
-        kwargs['include_docs'] = (not id_only)
-        if max_res > 0:
-            kwargs['limit'] = max_res
-        if reverse:
-            kwargs['descending'] = True
-        # TODO: Add more view params (see http://wiki.apache.org/couchdb/HTTP_view_API)
+
+        view_args = self._get_view_args(kwargs)
+        view_args['include_docs'] = (not id_only)
         view_doc = design_name if design_name == "_all_docs" else self._get_viewname(design_name, view_name)
-        view = ds.view(view_doc, **kwargs)
-        key = start_key or []
-        endkey = end_key or []
-        endkey.append(END_MARKER)
-        if reverse:
-            rows = view[endkey:key]
+        if keys:
+            view_args['keys'] = keys
+        view = ds.view(view_doc, **view_args)
+        if key is not None:
+            rows = view[key]
+            log.info("find_by_view(): key=%s" % key)
+        elif keys:
+            rows = view
+            log.info("find_by_view(): keys=%s" % keys)
+        elif start_key and end_key:
+            startkey = start_key or []
+            endkey = list(end_key) or []
+            endkey.append(END_MARKER)
+            log.info("find_by_view(): start_key=%s to end_key=%s" % (startkey, endkey))
+            if view_args.get('descending', False):
+                rows = view[endkey:startkey]
+            else:
+                rows = view[startkey:endkey]
         else:
-            rows = view[key:endkey]
+            rows = view
 
         if id_only:
             res_rows = [(row['id'],row['key'], None) for row in rows]
@@ -647,7 +682,7 @@ class CouchDB_DataStore(DataStore):
             else:
                 res_rows = [(row['id'],row['key'],row['doc']) for row in rows]
 
-        log.debug("find_by_view() found %s objects" % (len(res_rows)))
+        log.info("find_by_view() found %s objects" % (len(res_rows)))
         return res_rows
 
     def _ion_object_to_persistence_dict(self, ion_object):

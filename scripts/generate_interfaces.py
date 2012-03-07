@@ -2,7 +2,7 @@
 
 # Ion utility for generating interfaces from object definitions (and vice versa).
 
-__author__ = 'Adam R. Smith, Thomas Lennan, Stephen Henrie'
+__author__ = 'Adam R. Smith, Thomas Lennan, Stephen Henrie, Dave Foster <dfoster@asascience.com>'
 __license__ = 'Apache 2.0'
 
 import ast
@@ -50,6 +50,7 @@ import interface.objects
 from pyon.core.bootstrap import IonObject
 from pyon.service.service import BaseService, BaseClients
 from pyon.net.endpoint import RPCClient, ProcessRPCClient
+from pyon.util.log import log
 ${dep_client_imports}
 
 ${clientsholder}
@@ -147,24 +148,28 @@ ${methods}
 ''',
     'method':
 '''
-    def ${name}(${args}, headers=None):
+    def ${name}(${args}, headers=None, timeout=None):
         ${methoddocstring}
-        return self.request(IonObject('${req_in_obj_name}', **{$req_in_obj_args}), op='${name}', headers=headers)
+        return self.request(IonObject('${req_in_obj_name}', **{$req_in_obj_args}), op='${name}', headers=headers, timeout=timeout)
 ''',
     'obj_arg': "'${name}': ${name} or ${default}",
     'obj_arg_no_def': "'${name}': ${name}",
     'rpcclient':
 '''class ${name}Client(RPCClient, ${name}ClientMixin):
-    def __init__(self, name=None, node=None, **kwargs):
-        name = name or '${targetname}'
-        RPCClient.__init__(self, name=name, node=node, **kwargs)
+    def __init__(self, to_name=None, name=None, node=None, **kwargs):
+        if name is not None:
+            log.warn("${name}Client: 'name' parameter is deprecated, please use to_name")
+        to_name = to_name or name or '${targetname}'
+        RPCClient.__init__(self, to_name=to_name, node=node, **kwargs)
         ${name}ClientMixin.__init__(self)
 ''',
     'processrpcclient':
 '''class ${name}ProcessClient(ProcessRPCClient, ${name}ClientMixin):
-    def __init__(self, process=None, name=None, node=None, **kwargs):
-        name = name or '${targetname}'
-        ProcessRPCClient.__init__(self, process=process, name=name, node=node, **kwargs)
+    def __init__(self, process=None, to_name=None, name=None, node=None, **kwargs):
+        if name is not None:
+            log.warn("${name}Client: 'name' parameter is deprecated, please use to_name")
+        to_name = to_name or name or '${targetname}'
+        ProcessRPCClient.__init__(self, process=process, to_name=to_name, node=node, **kwargs)
         ${name}ClientMixin.__init__(self)
 '''
 }
