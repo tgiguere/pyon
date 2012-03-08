@@ -610,6 +610,7 @@ class PointSupplementConstructor(object):
             # Use defined axis names from the CRS definition
             self.coordinate_axis = (time_axis,'Longitude','Latitude')
             # These are in order - we use the order when adding points
+
         elif geo_coordinate_vector.reference_frame == 'urn:ogc:def:crs:EPSG::4979':
 
             # Use defined axis names from the CRS definition
